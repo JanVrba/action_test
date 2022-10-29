@@ -1,0 +1,169 @@
+name: Publish Docker Image
+
+on: [workflow_dispatch]
+
+permissions:
+  id-token: write # This is required for requesting the JWT
+  contents: read  # This is required for actions/checkout
+
+jobs:
+  publish-docker:
+    runs-on: ubuntu-latest
+    steps:
+      - name: checkout repo
+        uses: actions/checkout@v3
+
+      - name: Set up JDK
+        uses: actions/setup-java@v3
+        with:
+          distribution: 'corretto'
+          java-version: 8
+          cache: 'maven'
+
+      - name: Run maven
+        run: mvn -f ./PMG_BOI/pom.xml clean install -U -Dmaven.test.skip=false -Dmaven.test.failure.ignore=true -s ./ci/settings.xml
+        env:
+          JFROG_USERNAME: ${{ secrets.ARTIFACTORY_USERNAME }}
+          JFROG_PASSWORD: ${{ secrets.ARTIFACTORY_PASSWORD }}
+
+#      - name: Check Working Directory
+#        run: pwd
+#        shell: bash
+
+      - name: Get Release Version
+        run: |
+          CURRENT_VERSION=$(grep -oPm1 "(?<=<version>)[^<]+" "./PMG_BOI/pom.xml")
+          REVISION_VERSION=$(git rev-parse --short HEAD)
+          echo "releaseVersion=$CURRENT_VERSION-rev-$REVISION_VERSION" > release_version.txt
+        shell: bash
+
+      - name: Upload TMS Config Templates
+        uses: actions/upload-artifact@v3
+        with:
+          name: TMS Config Templates
+          path: ./PMG_BOI/src/main/resources/config-templates/*
+          retention-days: 5
+
+      - name: Upload TMS War
+        uses: actions/upload-artifact@v3
+        with:
+          name: TMS War
+          path: ./PMG_BOI/target/*.war
+          retention-days: 5
+
+      - name: Upload TMS Docker files
+        uses: actions/upload-artifact@v3
+        with:
+          name: TMS Docker files
+          path: ./PMG_BOI/src/main/resources/docker-release/*
+          retention-days: 5
+
+      - name: Upload TMS release version
+        uses: actions/upload-artifact@v3
+        with:
+          name: TMS release_version
+          path: ./release_version.txt
+          retention-days: 5
+
+      - name: Copy Modules
+        run: mkdir -p docker-release/modules
+        shell: bash
+
+#         Configure access to S3 bucket with modules
+#         aws configure set region us-east-1
+#         aws configure set aws_access_key_id ${bamboo.node3_devfat_aws_access_key_id}
+#         aws configure set aws_secret_access_key ${bamboo.node3_devfat_aws_secret_access_key}
+
+#         Sync modules
+#         aws s3 sync s3://aevi-us-pgw-bamboo-artifacts/tms-modules docker-release/modules
+
+      - name: Assume AWS role
+        id: assume-aws-role
+        uses: aevi-devops/action-assume-aevi-aws-role@main
+        with:
+          targetAwsAccount: 282622285742
+
+#      S3 Buckets Steps won't be used
+#      - name: Configure access to S3 bucket with modules
+#        run: |
+#            aws configure set region us-east-1
+#            aws configure set aws_access_key_id ${{ env.AWS_ACCESS_KEY_ID }}
+#            aws configure set aws_secret_access_key ${{ env.AWS_SECRET }}
+#            aws s3 sync s3://aevi-us-pgw-bamboo-artifacts/tms-modules docker-release/modules
+
+      - name : Download Docker file
+        uses: actions/download-artifact@v3
+        with:
+          name: TMS Docker files
+          path: .
+
+      - name: Download TMS War
+        uses: actions/download-artifact@v3
+        with:
+          name: TMS War
+          path: ./PMG_BOI/src/main/resources/docker-release/war/
+
+#      - name: Display structure of downloaded files
+#        run: ls -R
+#        working-directory: ./PMG_BOI/src/main/resources/docker-release/war/
+
+#      - name: Check Directory structure
+#        run: tree -c
+#        shell: bash
+
+      - name : change script permission entrypoint
+        run: chmod +x ./PMG_BOI/src/main/resources/docker-release/entrypoint.sh
+        shell: bash
+
+      - name: Build Docker Image
+        run: docker build -t tms .
+        shell: bash
+
+#     - name: Inject release version from file
+#        run: |
+#          RELEASE_VERSION=$(grep 'releaseVersion=' './release_version.txt' | cut -d = -f2)
+#          echo "$RELEASE_VERSION"
+#          echo ${{ env.Release_Version }}
+#       env:
+#         Release_Version: $RELEASE_VERSION
+#       shell: bash
+
+#     - name: Check GITHUB ENV
+#        run: |
+#            echo "RELEASE_VERSION=$(grep 'releaseVersion=' './release_version.txt' | cut -d = -f2)" >> $GITHUB_ENV
+#            echo ${{ env.RELEASE_VERSION }}
+
+      - name: Inject Variable
+        id: get-output
+        run: |
+          echo "RELEASE_VERSION=$(grep 'releaseVersion=' './release_version.txt' | cut -d = -f2)" >> $GITHUB_OUTPUT
+
+#     - name: List of ENV Variables
+#       run: env
+#        shell: bash
+
+#      - name: Push Docker Image into DEV/FAT Node3 AWS
+#        run: |
+#        echo "Release Version:" ${{ steps.get-output.outputs.RELEASE_VERSION }}
+#        RELEASE_VERSION=${{ steps.get-output.outputs.RELEASE_VERSION }}
+#        docker tag tms 282622285742.dkr.ecr.eu-central-1.amazonaws.com/devops-test:v.$RELEASE_VERSION
+#        echo " NEXT STEP CONFIGURE AWS CREDETIALS.."
+#        shell: bash
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-region: eu-central-1
+          role-to-assume: arn:aws:iam::282622285742:role/aevi-migration-github-actions-role
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v1
+
+      - name: Push Docker Image into DEV/FAT Node3 AWS
+        run: |
+          RELEASE_VERSION=${{ steps.get-output.outputs.RELEASE_VERSION }}
+          echo "Pushing image to ECR..."
+          docker tag tms 282622285742.dkr.ecr.eu-central-1.amazonaws.com/devops-test:v.$RELEASE_VERSION
+          docker push 282622285742.dkr.ecr.eu-central-1.amazonaws.com/devops-test:v.$RELEASE_VERSION
+          docker rmi 282622285742.dkr.ecr.eu-central-1.amazonaws.com/devops-test:v.$RELEASE_VERSION
